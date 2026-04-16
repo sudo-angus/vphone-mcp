@@ -2,7 +2,6 @@
 
 import base64
 import os
-import sys
 import tempfile
 from pathlib import Path
 
@@ -52,7 +51,7 @@ def _client() -> VPhoneClient:
 def _require_ok(resp: dict) -> str:
     """Return success message or raise with error detail."""
     if resp.get("ok"):
-        return resp.get("path") or "ok"
+        return resp.get("message") or resp.get("path") or "ok"
     raise RuntimeError(resp.get("error", "unknown error"))
 
 
@@ -89,23 +88,39 @@ def volume_down() -> str:
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
-def screenshot() -> list:
-    """Take a screenshot of the VM display and return it as an image.
+def screenshot(full_resolution: bool = False) -> str:
+    """Take a screenshot of the VM display and save it to a temp file.
 
-    Returns the screenshot as an embedded image that can be analyzed visually.
+    Returns the file path. Use the Read tool to view the image.
+
+    Prefer the default compact format for all routine work (reading UI text,
+    locating tap targets, verifying navigation state). Only use
+    full_resolution=True when you specifically need color accuracy
+    (e.g. verifying theme colors, checking image assets).
+
+    Tap coordinates use the full-resolution pixel space (1290x2796). If you
+    identified a target in a compact screenshot (430x932), multiply the
+    coordinates by 3 before calling tap().
+
+    Args:
+        full_resolution: If False (default), saves a compact grayscale JPEG
+            (430x932, ~20-50KB) suitable for layout analysis and text recognition.
+            If True, saves a full-resolution color PNG (1290x2796, 2-5MB).
     """
-    path = os.path.join(tempfile.gettempdir(), "vphone-mcp-screen.png")
-    resp = _client().screenshot(path)
-    _require_ok(resp)
+    if full_resolution:
+        path = os.path.join(tempfile.gettempdir(), "vphone-mcp-screen.png")
+        resp = _client().screenshot(path)
+        _require_ok(resp)
+        return path
 
-    image_data = Path(path).read_bytes()
-    return [
-        {
-            "type": "image",
-            "data": base64.b64encode(image_data).decode(),
-            "mimeType": "image/png",
-        }
-    ]
+    resp = _client().screenshot()
+    _require_ok(resp)
+    image_b64 = resp.get("image")
+    if not image_b64:
+        raise RuntimeError("no image data in response")
+    path = os.path.join(tempfile.gettempdir(), "vphone-mcp-screen.jpg")
+    Path(path).write_bytes(base64.b64decode(image_b64))
+    return path
 
 
 # ---------------------------------------------------------------------------
@@ -114,7 +129,12 @@ def screenshot() -> list:
 
 @mcp.tool()
 def open_app(name: str) -> str:
-    """Open an app from the home screen by name.
+    """Tap a preset system app icon on the default home screen.
+
+    IMPORTANT: This only works for the 18 built-in apps listed below. For any
+    third-party or user-installed app, use launch_app(bundle_id) instead — it
+    can start any app by bundle identifier. Use list_apps() to discover
+    installed apps and their bundle IDs.
 
     First presses home to ensure we're on the home screen, then taps the app.
 
@@ -125,8 +145,8 @@ def open_app(name: str) -> str:
     pos = app_position(name)
     if pos is None:
         raise ValueError(
-            f"Unknown app '{name}'. Use tap() for apps not on the default home screen, "
-            f"or use open_url() to launch by URL scheme."
+            f"Unknown app '{name}'. This tool only supports 18 preset system apps. "
+            f"Use launch_app(bundle_id) for third-party apps, or open_url() for URL schemes."
         )
     # Go home first to ensure we're on page 1
     _require_ok(_client().key("home"))
@@ -196,8 +216,10 @@ def swipe_to_previous_page() -> str:
 def tap(x: int, y: int) -> str:
     """Tap at specific pixel coordinates on the screen.
 
-    Coordinates are in pixels matching the screenshot dimensions (1290x2796).
-    Use screenshot() first to identify the target position.
+    Coordinates use the full-resolution pixel space (1290x2796), regardless
+    of whether you took a compact or full-resolution screenshot. If you
+    identified a target in a compact screenshot (430x932), multiply the
+    coordinates by 3 to get the tap position.
 
     Args:
         x: Horizontal pixel coordinate (0=left, 1290=right)
@@ -220,6 +242,142 @@ def swipe(x1: int, y1: int, x2: int, y2: int, duration_ms: int = 300) -> str:
         duration_ms: Swipe duration in milliseconds (default 300)
     """
     return _require_ok(_client().swipe(x1, y1, x2, y2, ms=duration_ms))
+
+
+# ---------------------------------------------------------------------------
+# Layer 5: App management
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+def install_ipa(path: str) -> str:
+    """Install an IPA file onto the iOS VM.
+
+    The IPA will be automatically signed and installed. No Apple Developer
+    account is needed — the guest uses ldid for ad-hoc signing.
+
+    Args:
+        path: Absolute path to the .ipa file on the host machine
+    """
+    return _require_ok(_client().ipa_install(path))
+
+
+@mcp.tool()
+def launch_app(bundle_id: str, url: str = "") -> str:
+    """Launch any app on the iOS VM by its bundle identifier.
+
+    This is the primary way to open apps programmatically. Unlike open_app()
+    which only handles 18 preset system apps via coordinate tapping, this tool
+    sends a launch request to the iOS guest daemon and works for any installed
+    app. Use list_apps() to discover installed apps and their bundle IDs.
+
+    Args:
+        bundle_id: The app's bundle identifier (e.g. 'com.apple.mobilesafari',
+            'com.bytedance.commercepro'). Use list_apps() to find it.
+        url: Optional URL to open with the app (URL Scheme or Universal Link)
+    """
+    resp = _client().app_launch(bundle_id, url=url or None)
+    _require_ok(resp)
+    pid = resp.get("pid", 0)
+    return f"Launched {bundle_id} (pid: {pid})"
+
+
+@mcp.tool()
+def terminate_app(bundle_id: str) -> str:
+    """Terminate a running app on the iOS VM.
+
+    Args:
+        bundle_id: The app's bundle identifier
+    """
+    return _require_ok(_client().app_terminate(bundle_id))
+
+
+@mcp.tool()
+def list_apps(filter: str = "user") -> str:
+    """List installed apps on the iOS VM.
+
+    Args:
+        filter: Filter type — 'all', 'user', 'system', or 'running'
+    """
+    resp = _client().app_list(filter=filter)
+    _require_ok(resp)
+    apps = resp.get("apps", [])
+    lines = []
+    for app in apps:
+        line = f"{app.get('name', '?')} ({app.get('bundle_id', '?')})"
+        if app.get("version"):
+            line += f" v{app['version']}"
+        if app.get("state") == "running":
+            line += f" [running, pid={app.get('pid', '?')}]"
+        lines.append(line)
+    return "\n".join(lines) if lines else "No apps found."
+
+
+# ---------------------------------------------------------------------------
+# Layer 6: File operations
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+def push_file(local_path: str, remote_path: str) -> str:
+    """Push a file from the host machine to the iOS VM guest filesystem.
+
+    Args:
+        local_path: Path to the source file on the host
+        remote_path: Destination path on the iOS VM (e.g. '/var/mobile/Documents/data.json')
+    """
+    resp = _client().file_push(local_path, remote_path)
+    _require_ok(resp)
+    size = resp.get("size", 0)
+    return f"Pushed {size} bytes to {remote_path}"
+
+
+@mcp.tool()
+def pull_file(remote_path: str, local_path: str) -> str:
+    """Pull a file from the iOS VM guest filesystem to the host machine.
+
+    Args:
+        remote_path: Path to the file on the iOS VM
+        local_path: Destination path on the host machine
+    """
+    resp = _client().file_pull(remote_path, local_path)
+    _require_ok(resp)
+    size = resp.get("size", 0)
+    return f"Saved {size} bytes to {local_path}"
+
+
+# ---------------------------------------------------------------------------
+# Layer 7: Clipboard & URL
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+def set_clipboard(text: str) -> str:
+    """Set the iOS VM clipboard content. This is NOT direct text input.
+
+    This tool only places text on the clipboard. To actually input text into
+    a UI field, you must then perform the paste gesture manually:
+      1. Tap the target text field to focus it
+      2. Call set_clipboard(text)
+      3. Long-press on the field (tap with ~1s hold), then tap "Paste"
+
+    Note: This clipboard-then-paste workflow is fragile and multi-step.
+    For reliable direct text input, the rpc-project integration
+    (accessibility.insert_text) is needed — see Phase 3.3 in PROGRESS.md.
+
+    Args:
+        text: The text to place on the clipboard
+    """
+    return _require_ok(_client().clipboard_set(text))
+
+
+@mcp.tool()
+def open_url(url: str) -> str:
+    """Open a URL on the iOS VM via the system URL handler.
+
+    Supports web URLs (https://...) and custom URL schemes (myapp://...).
+
+    Args:
+        url: The URL to open
+    """
+    return _require_ok(_client().open_url(url))
 
 
 # ---------------------------------------------------------------------------
