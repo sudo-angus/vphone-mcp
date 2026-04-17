@@ -3,6 +3,7 @@
 import base64
 import os
 import tempfile
+import zipfile
 from pathlib import Path
 
 from mcp.server.fastmcp import FastMCP
@@ -248,17 +249,122 @@ def swipe(x1: int, y1: int, x2: int, y2: int, duration_ms: int = 300) -> str:
 # Layer 5: App management
 # ---------------------------------------------------------------------------
 
+# vphone-cli's writeFully (VPhoneControl.swift) calls Darwin.write() once
+# with the full payload size.  macOS write(2) returns EINVAL when nbyte
+# exceeds INT_MAX (0x7FFFFFFF ≈ 2.1 GiB), so STORED archives above that
+# ceiling fail instantly with "protocol error: failed to write file data".
+# Keep some headroom under the cap and fall back to fast DEFLATE when the
+# raw .app contents won't fit.
+_STORE_SIZE_CAP = 1_900_000_000  # ~1.77 GiB
+
+
+def _raw_content_bytes(app_path: str) -> int:
+    """Sum of regular-file sizes inside a .app bundle (symlinks skipped)."""
+    total = 0
+    for root, _dirs, files in os.walk(app_path):
+        for name in files:
+            full = os.path.join(root, name)
+            if os.path.islink(full):
+                continue
+            try:
+                total += os.path.getsize(full)
+            except OSError:
+                pass
+    return total
+
+
+def _wrap_app_as_ipa(app_path: str) -> tuple[str, str]:
+    """Wrap a .app bundle into a temp IPA and return (ipa_path, mode).
+
+    Uses ZIP_STORED (no compression) by default so the wrap cost is bounded
+    by disk read + CRC32, roughly 1 GiB/s — an order of magnitude faster
+    than the ~10s a DEFLATE-compressed IPA of the same app would take.
+
+    For apps whose raw contents would produce a STORED archive over ~1.8
+    GiB, falls back to ZIP_DEFLATED level=1 so the resulting IPA stays
+    below the host 2 GiB vsock single-write ceiling.  The level-1 path is
+    slower (tens of seconds for a 2 GiB app) but still avoids default
+    DEFLATE's overhead.
+    """
+    app_abs = os.path.realpath(os.path.abspath(app_path))
+    app_name = os.path.basename(app_abs)
+
+    raw_bytes = _raw_content_bytes(app_abs)
+    if raw_bytes >= _STORE_SIZE_CAP:
+        compression = zipfile.ZIP_DEFLATED
+        mode = "deflate-l1"
+    else:
+        compression = zipfile.ZIP_STORED
+        mode = "store"
+
+    fd, ipa_path = tempfile.mkstemp(prefix="vphone-app-", suffix=".ipa")
+    os.close(fd)
+
+    def _add(src: str, arcname: str, zf: zipfile.ZipFile) -> None:
+        if os.path.islink(src):
+            target = os.readlink(src)
+            info = zipfile.ZipInfo(arcname)
+            info.create_system = 3  # Unix
+            # S_IFLNK | 0777 — tells unzip to recreate the symlink verbatim
+            info.external_attr = (0o120777 << 16)
+            zf.writestr(info, target)
+        elif os.path.isdir(src):
+            for child in sorted(os.listdir(src)):
+                _add(os.path.join(src, child), f"{arcname}/{child}", zf)
+        elif os.path.isfile(src):
+            zf.write(src, arcname, compress_type=compression)
+
+    try:
+        with zipfile.ZipFile(
+            ipa_path, "w", compression, allowZip64=True, compresslevel=1
+        ) as zf:
+            _add(app_abs, f"Payload/{app_name}", zf)
+    except Exception:
+        try:
+            os.unlink(ipa_path)
+        except OSError:
+            pass
+        raise
+
+    return ipa_path, mode
+
+
 @mcp.tool()
 def install_ipa(path: str) -> str:
-    """Install an IPA file onto the iOS VM.
+    """Install an .ipa file or a .app bundle onto the iOS VM.
 
-    The IPA will be automatically signed and installed. No Apple Developer
-    account is needed — the guest uses ldid for ad-hoc signing.
+    Accepts either:
+      - .ipa file: forwarded directly to the installer.
+      - .app bundle (directory): wrapped into a temporary IPA on the fly so
+        Xcode's raw build product can be installed without a manual zip
+        step.  Wrapping uses store mode (no compression) for typical apps,
+        finishing in about a second.  For apps whose raw contents exceed
+        ~1.8 GiB the wrap transparently falls back to fast DEFLATE so the
+        resulting IPA stays under the host's 2 GiB vsock single-write
+        limit; that path is slower (tens of seconds) but still avoids
+        default compression overhead.
+
+    The package is ad-hoc signed with ldid on the guest side; no Apple
+    Developer account is required.
 
     Args:
-        path: Absolute path to the .ipa file on the host machine
+        path: Absolute path to an .ipa file or a .app bundle on the host.
     """
-    return _require_ok(_client().ipa_install(path))
+    src = os.path.abspath(path)
+    if not os.path.exists(src):
+        raise FileNotFoundError(f"not found: {src}")
+
+    if os.path.isdir(src) and src.lower().endswith(".app"):
+        wrapped, _mode = _wrap_app_as_ipa(src)
+        try:
+            return _require_ok(_client().ipa_install(wrapped))
+        finally:
+            try:
+                os.unlink(wrapped)
+            except OSError:
+                pass
+
+    return _require_ok(_client().ipa_install(src))
 
 
 @mcp.tool()
