@@ -23,9 +23,12 @@ iOS VM
 ## Tool Layers
 
 1. **Hardware keys** — `go_home`, `press_power`, `volume_up`, `volume_down`
-2. **Screenshots** — `screenshot` (returns embedded image)
+2. **Screenshots** — `screenshot` (returns compact grayscale JPEG, 430x932)
 3. **Pre-mapped navigation** — `open_app`, `tap_back`, `scroll_down`, `scroll_up`, `open_notification_center`, `open_control_center`, `open_app_switcher`
 4. **Raw interaction** — `tap(x,y)`, `swipe(x1,y1,x2,y2)` for app-specific UI
+5. **App management** — `install_ipa`, `launch_app`, `terminate_app`, `list_apps`
+6. **File operations** — `push_file`, `pull_file`
+7. **Clipboard & URL** — `set_clipboard`, `open_url`
 
 ## Configuration
 
